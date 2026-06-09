@@ -47,7 +47,7 @@ let compareSelA = null, compareSelB = null;
 let _scatterGroups, _buildDataset;
 let mapMode = 'delta2y';
 let priceYearFrom = 2021, priceYearTo = 2025;
-let scatterLogY = false;
+let scatterLogX = false, scatterLogY = false;
 
 // ── Init ──────────────────────────────────────────────────────
 async function init() {
@@ -758,6 +758,7 @@ function initScatter() {
         x: d.erosion_rate,
         y: animated ? 0 : (logY ? symlog(d.price_delta_pct) : d.price_delta_pct),
         nom: d.nom,
+        orig: d.price_delta_pct,
       })),
     backgroundColor: group.color + 'cc',
     borderColor: group.color,
@@ -839,10 +840,12 @@ function initScatter() {
             label: (ctx) => {
               if (ctx.datasetIndex < SCATTER_GROUPS.length) {
                 const d = ctx.raw;
-                return `${d.nom} — recul: ${d.x} m/an, variation: ${d.y > 0 ? '+' : ''}${d.y?.toFixed(1) ?? '?'}%`;
+                const yReal = d.orig ?? (scatterLogY ? symlogInv(d.y) : d.y);
+                return `${d.nom} — recul: ${d.x} m/an, variation: ${yReal > 0 ? '+' : ''}${yReal?.toFixed(1) ?? '?'}%`;
               }
               const y = ctx.raw.y;
-              return `Tendance estimée : ${y > 0 ? '+' : ''}${y.toFixed(1)} %`;
+              const yReal = scatterLogY ? symlogInv(y) : y;
+              return `Tendance estimée : ${yReal > 0 ? '+' : ''}${yReal.toFixed(1)} %`;
             },
           },
         },
@@ -858,7 +861,20 @@ function initScatter() {
         x: {
           type: 'linear',
           title: { display: true, text: 'Taux de recul côtier (m/an)', font: { size: 12 } },
-          ticks: { callback: (v) => `${v} m/an` },
+          ticks: {
+            maxRotation: 0,
+            callback: (v) => {
+              if (scatterLogX) {
+                // En log, n'afficher que les valeurs 1×10ⁿ, 2×10ⁿ, 5×10ⁿ
+                if (v <= 0) return null;
+                const frac = Math.log10(v) - Math.floor(Math.log10(v));
+                const atNice = [0, Math.log10(2), Math.log10(5)]
+                  .some(n => Math.abs(frac - n) < 0.015);
+                return atNice ? `${v} m/an` : null;
+              }
+              return `${v} m/an`;
+            },
+          },
           grid: { color: '#f1f5f9' },
         },
         y: {
@@ -881,6 +897,7 @@ function initScatter() {
 
   document.getElementById('toggle-log-x').addEventListener('change', (e) => {
     const isLogX = e.target.checked;
+    scatterLogX = isLogX;
     scatterChart.options.scales.x.type = isLogX ? 'logarithmic' : 'linear';
     SCATTER_GROUPS.forEach((g, i) => {
       scatterChart.data.datasets[i].data = buildDataset(g, isLogX, scatterLogY).data;
