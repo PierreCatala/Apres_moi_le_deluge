@@ -25,7 +25,7 @@
       </button>
       <button id="btn-scatter" class="tab-btn" role="tab" aria-selected="false">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7" cy="12" r="1.5"/><circle cx="12" cy="7" r="1.5"/><circle cx="17" cy="16" r="1.5"/><circle cx="5" cy="18" r="1.5"/><circle cx="15" cy="4" r="1.5"/></svg>
-        Signal de marché
+        Nuage de points
       </button>
       <button id="btn-compare" class="tab-btn" role="tab" aria-selected="false">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="18"/><rect x="14" y="3" width="7" height="18"/></svg>
@@ -92,13 +92,57 @@
       </aside>
 
       <div id="map-legend">
+
+        <!-- 1. DÉCRET D'OBLIGATION -->
         <div class="legend-block">
-          <p class="legend-mode-group-label">Variation autour du décret</p>
+          <p class="legend-title">Décrets d'obligation d'information<br>des locataires et acquéreurs<br>sur les risques d'érosion <span class="nd-info" data-tooltip="Décrets n° 2022-750, 2023-698, 2024-531 et 2026-95. Obligent les vendeurs et bailleurs à informer acquéreurs et locataires de l'exposition de leur bien au recul du trait de côte. Le dispositif s'applique aux communes volontaires ayant demandé leur inscription.">?</span></p>
+
+          <div class="legend-sub-block">
+            <label class="legend-title-row">
+              <p class="legend-subtitle">Communes couvertes par un décret</p>
+              <span class="switch">
+                <input type="checkbox" id="toggle-erosion" checked>
+                <span class="switch-slider"></span>
+              </span>
+            </label>
+            <label class="legend-row">
+              <span class="legend-swatch swatch-fort"></span>
+              <span>Exposition forte</span>
+            </label>
+            <label class="legend-row">
+              <span class="legend-swatch swatch-moyen"></span>
+              <span>Exposition moyenne</span>
+            </label>
+          </div>
+
+          <div class="legend-sub-block">
+            <label class="legend-title-row">
+              <p class="legend-subtitle">Communes en recul du trait de côte<br>sans décret d'obligation d'information</p>
+              <span class="switch">
+                <input type="checkbox" id="toggle-nodecret" checked>
+                <span class="switch-slider"></span>
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <hr class="legend-sep">
+
+        <!-- 3. VARIATION DE PRIX -->
+        <div class="legend-block">
+          <label class="legend-title-row">
+            <p class="legend-title">Valeurs foncières</p>
+            <span class="switch">
+              <input type="checkbox" id="toggle-choropleth" checked>
+              <span class="switch-slider"></span>
+            </span>
+          </label>
+          <p class="legend-mode-group-label">Variation relative des prix moyens autour des prises de décrets</p>
           <div class="legend-mode-row">
             <button class="legend-mode-btn" data-mode="delta1y">1 an avant·après</button>
             <button class="legend-mode-btn active" data-mode="delta2y">2 ans avant·après</button>
           </div>
-          <div class="legend-mode-divider"></div>
+          <p class="legend-mode-group-label">Prix absolus</p>
           <div class="legend-mode-row">
             <button class="legend-mode-btn" data-mode="price">Prix médian au m²</button>
           </div>
@@ -114,61 +158,43 @@
             <div class="legend-ticks" id="legend-ticks"></div>
           </div>
           <div class="legend-labels" id="legend-labels"></div>
+          <p class="legend-explain hidden" id="legend-delta-explain">Variation du prix médian au m² dans la fenêtre temporelle sélectionnée</p>
         </div>
+
+        <hr class="legend-sep">
+
+        <!-- 4. VITESSE DE RECUL -->
         <div class="legend-block">
-          <p class="legend-title">Autres communes côtières</p>
-          <label class="switch-row">
-            <span class="switch-label">Communes sans décret</span>
-            <span class="switch">
-              <input type="checkbox" id="toggle-nodecret" checked>
-              <span class="switch-slider"></span>
-            </span>
-          </label>
-          <span class="nc-badge">Contour gris · prix absolus uniquement</span>
-        </div>
-        <div class="legend-block">
-          <p class="legend-title">Décrets obligation d'information</p>
-          <label class="switch-row">
-            <span class="switch-label">Afficher les contours</span>
-            <span class="switch">
-              <input type="checkbox" id="toggle-erosion" checked>
-              <span class="switch-slider"></span>
-            </span>
-          </label>
-          <label class="switch-row">
-            <span class="switch-label">Flèches de recul du trait de côte</span>
+          <label class="legend-title-row">
+            <p class="legend-title">Vitesse de recul du trait de côte <span class="nd-info" data-tooltip="Le taux de recul est calculé par comparaison de photographies aériennes anciennes (1920-1957) et récentes (2005-2014). Il représente une tendance structurelle, pas une mesure annuelle récente.">?</span></p>
             <span class="switch">
               <input type="checkbox" id="toggle-arrows" checked>
               <span class="switch-slider"></span>
             </span>
           </label>
           <div class="arrow-size-row">
-            <span class="arrow-size-label">Taille</span>
-            <input type="range" id="slider-arrows" min="0.5" max="10" step="0.25" value="1">
+            <span class="arrow-size-label">Épaisseur</span>
+            <input type="range" id="slider-arrows" min="0.5" max="10" step="0.25" value="2">
           </div>
-          <div class="arrow-legend">
-            <div class="arrow-legend-item">
-              <svg class="al-svg" data-rate="0.1" viewBox="0 0 20 40"><polygon points="10,1 20,17 0,17" fill="#0f172a"/><rect x="7" y="15" width="6" height="24" fill="#0f172a"/></svg>
+          <div class="arc-legend">
+            <div class="arc-legend-item">
+              <div class="arc-swatch" data-rate="0.1" style="background:#fde047"></div>
               <span>0,1 m/an</span>
+              <span class="arc-example">ex. Cancale (35)</span>
             </div>
-            <div class="arrow-legend-item">
-              <svg class="al-svg" data-rate="0.5" viewBox="0 0 20 40"><polygon points="10,1 20,17 0,17" fill="#0f172a"/><rect x="7" y="15" width="6" height="24" fill="#0f172a"/></svg>
+            <div class="arc-legend-item">
+              <div class="arc-swatch" data-rate="0.5" style="background:#f97316"></div>
               <span>0,5 m/an</span>
+              <span class="arc-example">ex. Lacanau (33)</span>
             </div>
-            <div class="arrow-legend-item">
-              <svg class="al-svg" data-rate="1" viewBox="0 0 20 40"><polygon points="10,1 20,17 0,17" fill="#0f172a"/><rect x="7" y="15" width="6" height="24" fill="#0f172a"/></svg>
-              <span>1 m/an</span>
+            <div class="arc-legend-item">
+              <div class="arc-swatch" data-rate="2" style="background:#dc2626"></div>
+              <span>2 m/an</span>
+              <span class="arc-example">ex. Sangatte (62)</span>
             </div>
           </div>
-          <label class="legend-row">
-            <span class="legend-swatch swatch-fort"></span>
-            <span>Exposition forte</span>
-          </label>
-          <label class="legend-row">
-            <span class="legend-swatch swatch-moyen"></span>
-            <span>Exposition moyenne</span>
-          </label>
         </div>
+
       </div>
 
       <div id="map-loading" class="loading-overlay">
@@ -181,7 +207,7 @@
     <section id="view-scatter" class="view hidden">
       <div class="scatter-header">
         <div>
-          <h2>Signal de marché</h2>
+          <h2>Nuage de points</h2>
           <p>Variation de prix autour de l'obligation d'information sur le risque érosion en fonction du taux de recul côtier mesuré</p>
         </div>
         <div class="scatter-controls">
@@ -226,28 +252,43 @@
     <!-- ── VUE COMPARAISON ────────────────────────────────────── -->
     <section id="view-compare" class="view hidden">
       <div class="compare-header">
-        <h2>Comparaison de communes</h2>
-        <div class="compare-search-row">
-          <div class="compare-search-box">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-            <input id="compare-search-a" type="text" placeholder="Commune A…" autocomplete="off">
-            <ul id="compare-results-a" class="search-dropdown hidden" role="listbox"></ul>
+        <div class="compare-title-row">
+          <h2>Comparaison de communes</h2>
+          <div class="compare-header-actions">
+            <div class="compare-view-toggle" role="group" aria-label="Mode d'affichage">
+              <button id="btn-compare-side" class="compare-view-btn active">Juxtaposition</button>
+              <button id="btn-compare-overlay" class="compare-view-btn">Superposition</button>
+            </div>
+            <div class="compare-export-btns">
+              <button id="btn-export-csv" class="compare-export-btn" title="Exporter en tableur CSV">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                CSV
+              </button>
+              <button id="btn-export-pdf" class="compare-export-btn" title="Exporter en PDF">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                PDF
+              </button>
+            </div>
           </div>
-          <span class="compare-vs">vs</span>
-          <div class="compare-search-box">
+        </div>
+        <div class="compare-add-row">
+          <div id="compare-chips" class="compare-chips"></div>
+          <div class="compare-search-box" id="compare-search-box">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-            <input id="compare-search-b" type="text" placeholder="Commune B…" autocomplete="off">
-            <ul id="compare-results-b" class="search-dropdown hidden" role="listbox"></ul>
+            <input id="compare-search-input" type="text" placeholder="Ajouter une commune…" autocomplete="off">
+            <ul id="compare-search-results" class="search-dropdown hidden" role="listbox"></ul>
           </div>
         </div>
       </div>
 
       <div id="compare-panels" class="compare-panels">
-        <div id="compare-panel-a" class="compare-panel empty">
-          <p class="compare-placeholder">Sélectionnez une commune A</p>
-        </div>
-        <div id="compare-panel-b" class="compare-panel empty">
-          <p class="compare-placeholder">Sélectionnez une commune B</p>
+        <p class="compare-empty-hint">Ajoutez des communes via la recherche ou en cliquant sur la carte.</p>
+      </div>
+
+      <div id="compare-overlay" class="hidden">
+        <div id="compare-overlay-legend" class="compare-overlay-legend"></div>
+        <div class="compare-overlay-canvas-wrap">
+          <canvas id="compare-overlay-chart"></canvas>
         </div>
       </div>
     </section>

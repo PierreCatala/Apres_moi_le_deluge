@@ -2,13 +2,7 @@
  * enrich-erosion.mjs — enrichit communes_littorales.geojson avec les
  * données réelles d'évolution du trait de côte (GéoLittoral / Cerema 2018).
  *
- * Source shapefile : N_evolution_trait_cote_S_fr_epsg2154_062018_shape.zip
- * Téléchargé depuis : https://geolittoral.din.developpement-durable.gouv.fr
- *
- * Doit être lancé après fetch.mjs (ou sample.mjs) :
- *   node pipeline/enrich-erosion.mjs
- *
- * Nécessite : npm install (shapefile proj4 @turf/turf déjà dans package.json)
+ * Usage : node pipeline/enrich-erosion.mjs
  */
 
 import shapefile from 'shapefile';
@@ -19,31 +13,31 @@ import { existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath }    from 'url';
 
-const __dir   = dirname(fileURLToPath(import.meta.url));
-const SHP     = resolve(__dir, 'erosion_shp/N_evolution_trait_cote_fr_epsg2154_S.shp');
-const GEOJSON = resolve(__dir, '../data/communes_littorales.geojson');
-const SCATTER = resolve(__dir, '../data/scatter.json');
-const ZIP_URL = 'https://geolittoral.din.developpement-durable.gouv.fr/telechargement/couches_sig/N_evolution_trait_cote_S_fr_epsg2154_062018_shape.zip';
+const __dir       = dirname(fileURLToPath(import.meta.url));
+const SHP         = resolve(__dir, 'erosion_shp/N_evolution_trait_cote_fr_epsg2154_S.shp');
+const GEOJSON     = resolve(__dir, '../data/communes_littorales.geojson');
+const SCATTER     = resolve(__dir, '../data/scatter.json');
+const COASTAL_ARCS = resolve(__dir, '../data/coastal_arcs.geojson');
+const SHP_ZIP = 'https://geolittoral.din.developpement-durable.gouv.fr/telechargement/couches_sig/N_evolution_trait_cote_S_fr_epsg2154_062018_shape.zip';
 
-// ── Proj4 : EPSG:2154 (Lambert 93) → WGS84 ───────────────────
+// Carto nationale : communes des départements côtiers (source : geo.api.gouv.fr)
+const COASTAL_DEPTS    = ['06','11','13','14','17','22','29','30','33','34','35','40','44','50','56','59','62','64','66','76','80','83','85','2A','2B'];
+const ALL_COMMUNES_CACHE = resolve(__dir, 'all_communes_cache.json');
+
+// ── Proj4 : Lambert 93 → WGS84 ────────────────────────────────
 const L93 = '+proj=lcc +lat_1=49 +lat_2=44 +lat_0=46.5 +lon_0=3 +x_0=700000 +y_0=6600000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs';
 proj4.defs('EPSG:2154', L93);
 const toWGS84 = proj4('EPSG:2154', 'WGS84');
 
-function reprojectCoords(coords) {
-  if (!Array.isArray(coords)) return coords;
-  if (typeof coords[0] === 'number') {
-    return toWGS84.forward(coords);
-  }
-  return coords.map(reprojectCoords);
+function reprojectCoords(c) {
+  if (!Array.isArray(c)) return c;
+  if (typeof c[0] === 'number') return toWGS84.forward(c);
+  return c.map(reprojectCoords);
+}
+function reprojectGeometry(g) {
+  return g ? { ...g, coordinates: reprojectCoords(g.coordinates) } : null;
 }
 
-function reprojectGeometry(geom) {
-  if (!geom) return null;
-  return { ...geom, coordinates: reprojectCoords(geom.coordinates) };
-}
-
-// ── Helpers ───────────────────────────────────────────────────
 function median(arr) {
   if (!arr.length) return null;
   const s = [...arr].sort((a, b) => a - b);
@@ -55,192 +49,261 @@ function classifyTaux(taux) {
   if (!taux || taux === -9999) return null;
   if (taux < -1.5) return 'fort';
   if (taux < 0)    return 'moyen';
-  return null; // stable or accretion
+  return null;
 }
 
-// ── Étape 1 — Vérifier / télécharger le shapefile ─────────────
-async function ensureShapefile() {
-  if (existsSync(SHP)) {
-    console.log('  Shapefile déjà présent.');
-    return;
+// ── Carto nationale des communes ──────────────────────────────
+async function ensureAllCommunes() {
+  if (existsSync(ALL_COMMUNES_CACHE)) {
+    const data = JSON.parse(await readFile(ALL_COMMUNES_CACHE, 'utf8'));
+    console.log(`  Communes (cache) : ${data.length}`);
+    return data;
   }
-  console.log(`  Téléchargement depuis GéoLittoral (~1 Mo)…`);
-  const res = await fetch(ZIP_URL);
-  if (!res.ok) throw new Error(`HTTP ${res.status} lors du téléchargement du ZIP`);
-  const buf = Buffer.from(await res.arrayBuffer());
 
-  const zipPath = resolve(__dir, 'erosion.zip');
-  await writeFile(zipPath, buf);
+  console.log('  Téléchargement carto nationale des communes (une seule fois)…');
+  const all = [];
+  for (const dept of COASTAL_DEPTS) {
+    process.stdout.write(`  dept ${dept}… `);
+    try {
+      const res = await fetch(
+        `https://geo.api.gouv.fr/communes?codeDepartement=${dept}&fields=code&format=geojson&geometry=contour`
+      );
+      if (!res.ok) { console.log(`skip (${res.status})`); continue; }
+      const gj = await res.json();
+      for (const f of gj.features ?? []) {
+        if (!f.geometry) continue;
+        all.push({ code: f.properties.code, bbox: turf.bbox(f), geometry: f.geometry });
+      }
+      console.log(`${(gj.features ?? []).length}`);
+    } catch (err) { console.log(`ERREUR: ${err.message}`); }
+  }
 
-  // Extraction via PowerShell (Windows)
-  const { execSync } = await import('child_process');
-  const outDir = resolve(__dir, 'erosion_shp');
-  await mkdir(outDir, { recursive: true });
-  execSync(`powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${outDir}' -Force"`);
-  console.log('  Extraction terminée.');
+  await writeFile(ALL_COMMUNES_CACHE, JSON.stringify(all));
+  console.log(`  → ${all.length} communes mises en cache`);
+  return all;
 }
 
-// ── Étape 2 — Lire le shapefile et reprojeter ─────────────────
-async function loadErosionSegments() {
-  console.log('\n── Lecture du shapefile érosion ──');
-  const src = await shapefile.open(SHP);
-  const segments = [];
-  let skipped = 0;
+// ── Shapefile érosion ─────────────────────────────────────────
+async function ensureShapefile() {
+  if (existsSync(SHP)) { console.log('  Shapefile érosion déjà présent.'); return; }
+  console.log('  Téléchargement depuis GéoLittoral…');
+  const res = await fetch(SHP_ZIP);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const zipPath = resolve(__dir, 'erosion.zip');
+  await writeFile(zipPath, Buffer.from(await res.arrayBuffer()));
+  const { execSync } = await import('child_process');
+  await mkdir(resolve(__dir, 'erosion_shp'), { recursive: true });
+  execSync(`powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${resolve(__dir, 'erosion_shp')}' -Force"`);
+}
 
+async function loadErosionSegments() {
+  console.log('\n── Shapefile érosion ──');
+  const src = await shapefile.open(SHP);
+  const segs = [];
+  let skip = 0;
   while (true) {
     const { value, done } = await src.read();
     if (done) break;
-
     const taux = value.properties?.taux;
-    if (!taux || taux === -9999) { skipped++; continue; }   // no data
-    if (value.properties?.amenagemen === 1) { skipped++; continue; } // artificially stabilized
-
-    const geomWGS84 = reprojectGeometry(value.geometry);
-    if (!geomWGS84) continue;
-
-    segments.push({ taux, geom: geomWGS84 });
+    if (!taux || taux === -9999 || value.properties?.amenagemen === 1) { skip++; continue; }
+    const g = reprojectGeometry(value.geometry);
+    if (g) segs.push({ taux, geom: g });
   }
-
-  console.log(`  ${segments.length} segments valides (${skipped} ignorés — sans données ou artificiels)`);
-  return segments;
+  console.log(`  ${segs.length} segments valides (${skip} ignorés)`);
+  return segs;
 }
 
-// ── Étape 3 — Jointure spatiale ───────────────────────────────
-function enrichCommune(communeFeature, segments) {
+// ── Milieu de la frontière littorale ─────────────────────────
+// Points côtiers = points à plus de 20 m de toute frontière voisine.
+// Les segments d'érosion (matchGeoms) servent à choisir le bon arc
+// côtier quand la commune a plusieurs faces aquatiques (estuaire, lagune…).
+function coastalBoundaryMidpoint(communeGeom, neighborLines, matchGeoms) {
+  // Anneau extérieur du plus grand polygone
+  let outerRing;
+  if (communeGeom.type === 'Polygon') {
+    outerRing = communeGeom.coordinates[0];
+  } else {
+    let maxArea = -Infinity;
+    for (const pc of communeGeom.coordinates) {
+      const a = turf.area(turf.polygon(pc));
+      if (a > maxArea) { maxArea = a; outerRing = pc[0]; }
+    }
+  }
+  const boundaryLine = turf.lineString(outerRing);
+  const totalLen = turf.length(boundaryLine, { units: 'kilometers' });
+
+  const STEP_KM   = 0.1;   // échantillonnage tous les 100 m
+  const SHARED_KM = 0.02;  // seuil "partagé avec un voisin" = 20 m
+  const coastDists = [];
+
+  for (let d = 0; d <= totalLen; d += STEP_KM) {
+    const pt = turf.along(boundaryLine, d, { units: 'kilometers' });
+    const isShared = neighborLines.some(line => {
+      try {
+        return turf.nearestPointOnLine(line, pt, { units: 'kilometers' }).properties.dist < SHARED_KM;
+      } catch { return false; }
+    });
+    if (!isShared) coastDists.push(d);
+  }
+
+  if (coastDists.length === 0) return null;
+
+  // Regrouper en arcs côtiers contigus (gap > 250 m = coupure)
+  const GAP = 2.5 * STEP_KM;
+  const arcs = [[coastDists[0]]];
+  for (let i = 1; i < coastDists.length; i++) {
+    if (coastDists[i] - coastDists[i - 1] < GAP) {
+      arcs[arcs.length - 1].push(coastDists[i]);
+    } else {
+      arcs.push([coastDists[i]]);
+    }
+  }
+
+  // Fusionner premier et dernier arc s'ils se rejoignent autour du point de départ
+  if (arcs.length > 1) {
+    const gapAcrossSeam = coastDists[0] + totalLen - coastDists[coastDists.length - 1];
+    if (gapAcrossSeam < GAP) {
+      const merged = [...arcs[arcs.length - 1], ...arcs[0].map(d => d + totalLen)];
+      arcs.splice(arcs.length - 1, 1);
+      arcs.splice(0, 1);
+      arcs.unshift(merged);
+    }
+  }
+
+  // Choisir le bon arc :
+  // — si plusieurs arcs : prendre celui dont le milieu est le plus proche
+  //   des centroides des segments d'érosion (qui sont sur la face marine)
+  // — sinon : prendre le plus long
+  let chosenArc;
+  if (arcs.length === 1) {
+    chosenArc = arcs[0];
+  } else if (matchGeoms && matchGeoms.length > 0) {
+    const segCentroids = matchGeoms.map(g =>
+      turf.centroid({ type: 'Feature', geometry: g }).geometry.coordinates
+    );
+    let minDist = Infinity;
+    chosenArc = arcs[0];
+    for (const arc of arcs) {
+      const midDist = arc[Math.floor(arc.length / 2)] % totalLen;
+      const midPt = turf.along(boundaryLine, midDist, { units: 'kilometers' });
+      const d = Math.min(...segCentroids.map(sc =>
+        turf.distance(midPt, turf.point(sc), { units: 'kilometers' })
+      ));
+      if (d < minDist) { minDist = d; chosenArc = arc; }
+    }
+  } else {
+    chosenArc = arcs.reduce((max, arc) => arc.length > max.length ? arc : max, arcs[0]);
+  }
+
+  const midDist = chosenArc[Math.floor(chosenArc.length / 2)] % totalLen;
+  const midpoint = turf.along(boundaryLine, midDist, { units: 'kilometers' }).geometry.coordinates;
+
+  // Arc sous-échantillonné tous les ~300 m pour export GeoJSON
+  const sub = Math.max(1, Math.round(0.3 / STEP_KM));
+  const arcCoords = [];
+  for (let i = 0; i < chosenArc.length; i += sub) {
+    arcCoords.push(turf.along(boundaryLine, chosenArc[i] % totalLen, { units: 'kilometers' }).geometry.coordinates);
+  }
+  const lastCoord = turf.along(boundaryLine, chosenArc[chosenArc.length - 1] % totalLen, { units: 'kilometers' }).geometry.coordinates;
+  if (arcCoords.length < 2) arcCoords.push(lastCoord);
+
+  return { midpoint, arcCoords };
+}
+
+// ── Centroïde de la commune ───────────────────────────────────
+function communeCentroid(communeGeom) {
+  if (communeGeom.type === 'Polygon') {
+    return turf.centroid(turf.feature(communeGeom)).geometry.coordinates;
+  }
+  let maxArea = -Infinity, largest = null;
+  for (const pc of communeGeom.coordinates) {
+    const poly = turf.polygon(pc);
+    const a = turf.area(poly);
+    if (a > maxArea) { maxArea = a; largest = poly; }
+  }
+  return turf.centroid(largest).geometry.coordinates;
+}
+
+// ── Enrichissement d'une commune ──────────────────────────────
+function enrichCommune(communeFeature, segments, neighborLines) {
   const communeGeom = communeFeature.geometry;
   if (!communeGeom) return null;
 
   const bbox = turf.bbox(communeFeature);
+  const matchTaux = [], matchGeoms = [];
 
-  const matchingTaux  = [];
-  const matchingGeoms = [];
   for (const seg of segments) {
-    const segBbox = turf.bbox({ type: 'Feature', geometry: seg.geom });
-    if (segBbox[2] < bbox[0] || segBbox[0] > bbox[2] ||
-        segBbox[3] < bbox[1] || segBbox[1] > bbox[3]) continue;
+    const sb = turf.bbox({ type: 'Feature', geometry: seg.geom });
+    if (sb[2] < bbox[0] || sb[0] > bbox[2] || sb[3] < bbox[1] || sb[1] > bbox[3]) continue;
     try {
-      const inter = turf.intersect(
-        turf.featureCollection([turf.feature(communeGeom), turf.feature(seg.geom)])
-      );
-      if (inter) { matchingTaux.push(seg.taux); matchingGeoms.push(seg.geom); }
+      if (turf.intersect(turf.featureCollection([turf.feature(communeGeom), turf.feature(seg.geom)])))
+        { matchTaux.push(seg.taux); matchGeoms.push(seg.geom); }
     } catch { }
   }
 
-  if (!matchingTaux.length) return null;
+  if (!matchTaux.length) return null;
 
-  const medianTaux  = median(matchingTaux);
-  const erosionRate = medianTaux < 0 ? Math.round(-medianTaux * 100) / 100 : null;
+  const medTaux    = median(matchTaux);
+  const erosionRate = medTaux < 0 ? Math.round(-medTaux * 100) / 100 : null;
 
-  // Arrow : origine sur le littoral mesuré, perpendiculaire au trait de côte vers l'intérieur
-  let arrowLng = null, arrowLat = null, arrowBearing = null;
-  if (erosionRate != null && erosionRate > 0 && matchingGeoms.length > 0) {
-    // Centroïdes par segment
-    const segCentroids = matchingGeoms.map(
-      g => turf.centroid({ type: 'Feature', geometry: g }).geometry.coordinates
-    );
+  let arrowLng = null, arrowLat = null, arrowBearing = null, arcCoords = null;
 
-    // Médoïde : segment dont la somme des distances aux autres est minimale.
-    // Pour les communes multi-façades (presqu'îles, baies), ancre la flèche
-    // sur la face qui concentre le plus de segments (face dominante d'érosion).
-    const anchorIdx = segCentroids.length === 1 ? 0 :
-      segCentroids
-        .map((c, i) => ({
-          i,
-          score: segCentroids.reduce(
-            (sum, o, j) => j !== i ? sum + (c[0]-o[0])**2 + (c[1]-o[1])**2 : sum,
-            0
-          ),
-        }))
-        .sort((a, b) => a.score - b.score)[0].i;
-    const origin = segCentroids[anchorIdx];
+  if (erosionRate > 0 && matchGeoms.length > 0) {
+    const centroid = communeCentroid(communeGeom);
 
-    const communeFeat = turf.feature(communeGeom);
-    const originPt    = turf.point(origin);
-
-    // Référence intérieure : centroïde du plus grand polygone
-    let centroidCoords;
-    if (communeGeom.type === 'Polygon') {
-      centroidCoords = turf.centroid(communeFeat).geometry.coordinates;
+    // Origine = milieu de l'arc côtier le plus proche des segments d'érosion
+    const info = coastalBoundaryMidpoint(communeGeom, neighborLines, matchGeoms);
+    let origin;
+    if (info) {
+      origin    = info.midpoint;
+      arcCoords = info.arcCoords;
     } else {
-      let maxArea = -Infinity, largestPoly = null;
-      for (const polyCoords of communeGeom.coordinates) {
-        const poly = turf.polygon(polyCoords);
-        const area = turf.area(poly);
-        if (area > maxArea) { maxArea = area; largestPoly = poly; }
-      }
-      centroidCoords = turf.centroid(largestPoly).geometry.coordinates;
-    }
-    const centroidBearing = turf.bearing(originPt, turf.point(centroidCoords));
-
-    // Écart angulaire normalisé [0, 180]
-    const angDiff = (a, b) => {
-      const d = ((a - b + 360) % 360);
-      return d > 180 ? 360 - d : d;
-    };
-
-    let inlandBearing;
-    if (segCentroids.length >= 2) {
-      // Direction côtière locale : vertices des 7 segments les plus proches de l'ancrage
-      const N_LOCAL = Math.min(7, segCentroids.length);
-      const nearVerts = segCentroids
-        .map((c, i) => ({ i, d: (c[0]-origin[0])**2 + (c[1]-origin[1])**2 }))
-        .sort((a, b) => a.d - b.d)
-        .slice(0, N_LOCAL)
-        .flatMap(({ i }) => {
-          const g = matchingGeoms[i];
-          return g.type === 'LineString'      ? g.coordinates :
-                 g.type === 'MultiLineString' ? g.coordinates.flat() : [];
-        });
-
-      let coastBearing;
-      if (nearVerts.length >= 2) {
-        const sv = [...nearVerts].sort((a, b) => a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1]);
-        coastBearing = turf.bearing(turf.point(sv[0]), turf.point(sv[sv.length - 1]));
-      } else {
-        const sc = [...segCentroids].sort((a, b) => a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1]);
-        coastBearing = turf.bearing(turf.point(sc[0]), turf.point(sc[sc.length - 1]));
-      }
-
-      const perp1 = ((coastBearing + 90) % 360 + 360) % 360;
-      const perp2 = ((coastBearing - 90) % 360 + 360) % 360;
-
-      // Toujours trancher via le centroïde (toujours à l'intérieur de la commune).
-      // Supprime les faux positifs de booleanPointInPolygon sur communes multi-polygones.
-      const diff1 = ((perp1 - centroidBearing + 360) % 360);
-      const angDiff1 = diff1 > 180 ? 360 - diff1 : diff1;
-      const diff2 = ((perp2 - centroidBearing + 360) % 360);
-      const angDiff2 = diff2 > 180 ? 360 - diff2 : diff2;
-      inlandBearing = angDiff1 <= angDiff2 ? perp1 : perp2;
-    } else {
-      inlandBearing = centroidBearing;
+      origin = turf.centroid({ type: 'Feature', geometry: matchGeoms[0] }).geometry.coordinates;
     }
 
-    arrowBearing = Math.round(inlandBearing);
+    arrowBearing = Math.round(turf.bearing(turf.point(origin), turf.point(centroid)));
     arrowLng     = +origin[0].toFixed(5);
     arrowLat     = +origin[1].toFixed(5);
   }
 
   return {
-    erosion_class: classifyTaux(medianTaux),
+    erosion_class: classifyTaux(medTaux),
     erosion_rate:  erosionRate,
     arrow_lng:     arrowLng,
     arrow_lat:     arrowLat,
     arrow_bearing: arrowBearing,
+    arcCoords,
   };
 }
 
-// ── Étape 4 — Mise à jour du GeoJSON ─────────────────────────
-async function enrichGeoJSON(segments) {
-  console.log('\n── Mise à jour du GeoJSON ──');
-  const raw    = await readFile(GEOJSON, 'utf8');
-  const gjson  = JSON.parse(raw);
-  const BEFORE = new Set(['2021-S1','2021-S2','2022-S1','2022-S2']);
+// ── Mise à jour du GeoJSON ────────────────────────────────────
+async function enrichGeoJSON(segments, allCommunes) {
+  console.log('\n── Enrichissement ──');
+  const gjson = JSON.parse(await readFile(GEOJSON, 'utf8'));
 
   let enriched = 0;
   const scatter = [];
+  const coastalArcFeatures = [];
 
   for (const feat of gjson.features) {
-    const result = enrichCommune(feat, segments);
+    const code    = feat.properties.code_insee;
+    const commBbox = turf.bbox(feat);
+
+    // Communes voisines candidates (bbox avec marge de 200 m)
+    const BUF = 0.002;
+    const neighborLines = allCommunes
+      .filter(c =>
+        c.code !== code &&
+        c.bbox[2] >= commBbox[0] - BUF && c.bbox[0] <= commBbox[2] + BUF &&
+        c.bbox[3] >= commBbox[1] - BUF && c.bbox[1] <= commBbox[3] + BUF
+      )
+      .map(c => {
+        try { return turf.polygonToLine({ type: 'Feature', geometry: c.geometry }); }
+        catch { return null; }
+      })
+      .filter(Boolean);
+
+    const result = enrichCommune(feat, segments, neighborLines);
 
     if (result) {
       feat.properties.erosion_class  = result.erosion_class;
@@ -249,9 +312,22 @@ async function enrichGeoJSON(segments) {
       feat.properties.arrow_lat      = result.arrow_lat;
       feat.properties.arrow_bearing  = result.arrow_bearing;
       if (result.erosion_class) enriched++;
+
+      // Stocker l'arc côtier pour coastal_arcs.geojson
+      if (result.arcCoords && result.arcCoords.length >= 2 && result.erosion_rate) {
+        coastalArcFeatures.push({
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: result.arcCoords },
+          properties: {
+            code_insee:    feat.properties.code_insee,
+            nom:           feat.properties.nom,
+            erosion_rate:  result.erosion_rate,
+            erosion_class: result.erosion_class,
+          },
+        });
+      }
     }
 
-    // Recompute scatter eligibility
     const p = feat.properties;
     if (p.erosion_rate && p.price_delta_pct !== null) {
       scatter.push({
@@ -267,29 +343,33 @@ async function enrichGeoJSON(segments) {
     process.stdout.write('.');
   }
 
-  console.log(`\n  ${enriched} communes enrichies avec données érosion réelles`);
-
+  console.log(`\n  ${enriched} communes enrichies`);
   await writeFile(GEOJSON, JSON.stringify(gjson, null, 2));
   await writeFile(SCATTER, JSON.stringify(scatter, null, 2));
-
-  console.log(`  scatter.json mis à jour : ${scatter.length} points`);
+  // Sauvegarder les arcs côtiers (bruts — sera patché par correct-arrows.mjs)
+  await writeFile(COASTAL_ARCS, JSON.stringify({ type: 'FeatureCollection', features: coastalArcFeatures }, null, 2));
+  console.log(`  scatter.json : ${scatter.length} points — coastal_arcs.geojson : ${coastalArcFeatures.length} arcs`);
 }
 
 // ── Main ──────────────────────────────────────────────────────
 async function main() {
-  console.log('\n🌊 Enrichissement érosion côtière (GéoLittoral 2018)\n');
-
+  console.log('\n🌊 Enrichissement érosion côtière\n');
   if (!existsSync(GEOJSON)) {
-    console.error(`❌ ${GEOJSON} introuvable. Lancez d'abord fetch.mjs ou sample.mjs.`);
+    console.error('❌ communes_littorales.geojson introuvable. Lancez d\'abord fetch.mjs.');
     process.exit(1);
   }
-
   await ensureShapefile();
-  const segments = await loadErosionSegments();
-  await enrichGeoJSON(segments);
+  const [segments, allCommunes] = await Promise.all([
+    loadErosionSegments(),
+    ensureAllCommunes(),
+  ]);
+  await enrichGeoJSON(segments, allCommunes);
 
-  console.log('\n✅ Enrichissement terminé !');
-  console.log('   Rechargez le site pour voir les données érosion réelles.\n');
+  // Corrections manuelles pour les communes avec géographie complexe
+  const { execSync } = await import('child_process');
+  execSync(`node "${resolve(__dir, 'correct-arrows.mjs')}"`, { stdio: 'inherit' });
+
+  console.log('\n✅ Terminé — rechargez le site.\n');
 }
 
 main().catch(err => { console.error('\n❌', err); process.exit(1); });

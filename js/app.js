@@ -1,8 +1,9 @@
 // ── Config ────────────────────────────────────────────────────
 const MAP_STYLE  = 'https://tiles.openfreemap.org/styles/positron';
-const DATA_GEOJSON   = 'data/communes_littorales.geojson';
-const DATA_NODECRET  = 'data/communes_nodecret.geojson';
-const DATA_SCATTER   = 'data/scatter.json';
+const DATA_GEOJSON      = 'data/communes_littorales.geojson';
+const DATA_NODECRET     = 'data/communes_nodecret.geojson';
+const DATA_SCATTER      = 'data/scatter.json';
+const DATA_COASTAL_ARCS = 'data/coastal_arcs.geojson';
 
 const COLORS = {
   quintiles: ['#ffffb2', '#fecc5c', '#fd8d3c', '#f03b20', '#bd0026'],
@@ -40,10 +41,16 @@ function windowDelta(bySem, obligationDate, n) {
 }
 
 // ── State ─────────────────────────────────────────────────────
+const COMPARE_COLORS = ['#0ea5e9','#a855f7','#f97316','#22c55e','#ef4444','#eab308'];
+const COMPARE_MAX = 6;
+
 let map, priceChart, scatterChart;
-let compareChartA, compareChartB;
-let geojson = null, nodecretGeojson = null, scatterData = [];
-let compareSelA = null, compareSelB = null;
+let compareCharts = new Map(); // code_insee → Chart
+let compareOverlayChart = null;
+let geojson = null, nodecretGeojson = null, scatterData = [], coastalArcsGeojson = null;
+let compareSelections = []; // array of props objects
+let showChoropleth = true;
+let compareViewMode = 'side'; // 'side' | 'overlay'
 let _scatterGroups, _buildDataset;
 let mapMode = 'delta2y';
 let priceYearFrom = 2021, priceYearTo = 2025;
@@ -62,14 +69,16 @@ async function init() {
 // ── Data loading ──────────────────────────────────────────────
 async function loadData() {
   try {
-    const [geoRes, scatRes, ncRes] = await Promise.all([
+    const [geoRes, scatRes, ncRes, arcsRes] = await Promise.all([
       fetch(DATA_GEOJSON),
       fetch(DATA_SCATTER),
       fetch(DATA_NODECRET).catch(() => null),
+      fetch(DATA_COASTAL_ARCS).catch(() => null),
     ]);
     geojson     = await geoRes.json();
     scatterData = await scatRes.json();
-    if (ncRes?.ok) nodecretGeojson = await ncRes.json();
+    if (ncRes?.ok)  nodecretGeojson  = await ncRes.json();
+    if (arcsRes?.ok) coastalArcsGeojson = await arcsRes.json();
 
     // Pré-calcul des deltas fenêtrés ±1 an et ±2 ans par commune
     for (const f of geojson.features) {
@@ -109,12 +118,17 @@ function initMap() {
   });
 
   map.on('click', 'communes-fill', (e) => {
-    const props = e.features[0]?.properties;
-    if (props) openSidebar(props);
+    const code = e.features[0]?.properties?.code_insee;
+    if (!code) return;
+    const feat = geojson?.features.find(f => f.properties.code_insee === code);
+    if (feat) openSidebar(feat.properties);
   });
   map.on('click', 'communes-nc-fill', (e) => {
-    const props = e.features[0]?.properties;
-    if (props) openSidebar(props);
+    const code = e.features[0]?.properties?.code_insee;
+    if (!code || !nodecretGeojson) return;
+    // Look up raw properties from in-memory GeoJSON to avoid MapLibre's nested-object serialization
+    const feat = nodecretGeojson.features.find(f => f.properties.code_insee === code);
+    if (feat) openSidebar(feat.properties);
   });
 
   map.on('mouseenter', 'communes-fill',    () => { map.getCanvas().style.cursor = 'pointer'; });
@@ -139,6 +153,31 @@ function addCommuneLayers() {
   window._quintileBreaks = breaks;
   window._priceMin = prices[0];
   window._priceMax = prices[prices.length - 1];
+
+  // Hatch pattern — exposition forte (diagonales grises pleines, fond transparent)
+  const HS = 16;
+  const hc = document.createElement('canvas');
+  hc.width = HS; hc.height = HS;
+  const hCtx = hc.getContext('2d');
+  hCtx.strokeStyle = 'rgba(55,65,81,0.85)';
+  hCtx.lineWidth = 1.5;
+  for (let i = -HS; i <= HS * 2; i += HS / 2) {
+    hCtx.beginPath(); hCtx.moveTo(i, HS); hCtx.lineTo(i + HS, 0); hCtx.stroke();
+  }
+  map.addImage('fort-hatch', { width: HS, height: HS, data: hCtx.getImageData(0, 0, HS, HS).data });
+
+  // Hatch pattern — exposition moyenne (diagonales grises en pointillés, fond transparent)
+  const MS = 16;
+  const mc = document.createElement('canvas');
+  mc.width = MS; mc.height = MS;
+  const mCtx = mc.getContext('2d');
+  mCtx.strokeStyle = 'rgba(55,65,81,0.85)';
+  mCtx.lineWidth = 1.5;
+  mCtx.setLineDash([3, 4]);
+  for (let i = -MS; i <= MS * 2; i += MS / 2) {
+    mCtx.beginPath(); mCtx.moveTo(i, MS); mCtx.lineTo(i + MS, 0); mCtx.stroke();
+  }
+  map.addImage('moyen-hatch', { width: MS, height: MS, data: mCtx.getImageData(0, 0, MS, MS).data });
 
   map.addSource('communes', { type: 'geojson', data: geojson });
 
@@ -196,29 +235,29 @@ function addCommuneLayers() {
     map.setFilter('communes-hover', ['==', ['get', 'code_insee'], '']);
   });
 
-  // Erosion overlay — fort (rouge plein, bordure épaisse)
+  // Erosion overlay — fort (hachuré diagonal rouge)
   map.addLayer({
     id: 'erosion-fort-fill',
     type: 'fill',
     source: 'communes',
     filter: ['==', ['get', 'erosion_class'], 'fort'],
-    paint: { 'fill-color': COLORS.fort.fill },
+    paint: { 'fill-pattern': 'fort-hatch' },
   });
   map.addLayer({
     id: 'erosion-fort-outline',
     type: 'line',
     source: 'communes',
     filter: ['==', ['get', 'erosion_class'], 'fort'],
-    paint: { 'line-color': COLORS.fort.stroke, 'line-width': 2.5 },
+    paint: { 'line-color': 'rgba(55,65,81,0.75)', 'line-width': 2.5 },
   });
 
-  // Erosion overlay — moyen (jaune-ambre, bordure pointillée)
+  // Erosion overlay — moyen (rayures oranges en pointillés, fond transparent)
   map.addLayer({
     id: 'erosion-moyen-fill',
     type: 'fill',
     source: 'communes',
     filter: ['==', ['get', 'erosion_class'], 'moyen'],
-    paint: { 'fill-color': COLORS.moyen.fill },
+    paint: { 'fill-pattern': 'moyen-hatch' },
   });
   map.addLayer({
     id: 'erosion-moyen-outline',
@@ -226,7 +265,7 @@ function addCommuneLayers() {
     source: 'communes',
     filter: ['==', ['get', 'erosion_class'], 'moyen'],
     paint: {
-      'line-color': COLORS.moyen.stroke,
+      'line-color': 'rgba(55,65,81,0.75)',
       'line-width': 2,
       'line-dasharray': [3, 2],
     },
@@ -284,7 +323,7 @@ function addCommuneLayers() {
     });
   }
 
-  try { addArrowLayer(); } catch (e) { console.warn('addArrowLayer:', e); }
+  try { addCoastalArcLayer(); } catch (e) { console.warn('addCoastalArcLayer:', e); }
 
   // Bind map mode buttons
   document.querySelectorAll('.legend-mode-btn').forEach(btn =>
@@ -319,6 +358,12 @@ function addCommuneLayers() {
     });
   });
 
+  // Toggle valeurs foncières (choropleth)
+  document.getElementById('toggle-choropleth').addEventListener('change', (e) => {
+    showChoropleth = e.target.checked;
+    updateMapMode(mapMode);
+  });
+
   // Toggle erosion contours
   document.getElementById('toggle-erosion').addEventListener('change', (e) => {
     const vis = e.target.checked ? 'visible' : 'none';
@@ -326,107 +371,77 @@ function addCommuneLayers() {
       .forEach(id => map.setLayoutProperty(id, 'visibility', vis));
   });
 
-  // Toggle arrows (separate)
+  // Toggle trait de côte
   document.getElementById('toggle-arrows').addEventListener('change', (e) => {
-    if (map.getLayer('erosion-arrows'))
-      map.setLayoutProperty('erosion-arrows', 'visibility', e.target.checked ? 'visible' : 'none');
+    if (map.getLayer('coastal-arcs-line'))
+      map.setLayoutProperty('coastal-arcs-line', 'visibility', e.target.checked ? 'visible' : 'none');
   });
 
-  // Slider taille flèches
+  // Slider épaisseur trait de côte
   document.getElementById('slider-arrows').addEventListener('input', (e) => {
     const m = parseFloat(e.target.value);
-    if (map.getLayer('erosion-arrows'))
-      map.setLayoutProperty('erosion-arrows', 'icon-size', arrowSizeExpr(m));
-    updateArrowLegend();
+    if (map.getLayer('coastal-arcs-line'))
+      map.setPaintProperty('coastal-arcs-line', 'line-width', arcWidthExpr(m));
+    updateArcLegend();
   });
-  updateArrowLegend();
+  updateArcLegend();
 }
 
-function arrowSizeExpr(m) {
-  const logRate = ['ln', ['+', 1, ['*', 10, ['min', ['get', 'rate'], 12]]]];
+// Couleurs du spectre érosion : jaune → orange → rouge (échelle log)
+const ARC_COLOR_EXPR = [
+  'interpolate', ['linear'], ['ln', ['max', ['get', 'erosion_rate'], 0.01]],
+  -2.303, '#fde047',   // ln(0.1) — jaune
+  -0.693, '#f97316',   // ln(0.5) — orange
+   0.693, '#dc2626',   // ln(2)   — rouge
+];
+
+function arcWidthExpr(m) {
+  // 0.5 + ln(rate/0.1) → 0.5px à 0.1 m/an, ~2.1px à 0.5, ~3.5px à 2, ~4.6px à 6
+  const logRate = ['+', 0.5, ['max', 0, ['ln', ['/', ['max', ['get', 'erosion_rate'], 0.01], 0.1]]]];
   return [
     'interpolate', ['linear'], ['zoom'],
-    5,  ['*', 0.055 * m, logRate],
-    10, ['*', 0.14  * m, logRate],
+    5,  ['*', 0.8 * m, logRate],
+    11, ['*', 2.2 * m, logRate],
   ];
 }
 
-function updateArrowLegend() {
+function updateArcLegend() {
   const m    = parseFloat(document.getElementById('slider-arrows')?.value ?? 1);
-  const zoom = map ? Math.max(5, Math.min(10, map.getZoom())) : 7;
-  const t    = (zoom - 5) / 5;                          // 0 à zoom 5, 1 à zoom 10
-  const factor = 0.055 + t * (0.14 - 0.055);           // même interpolation que la couche
-  const CANVAS_H = 40, CANVAS_W = 20;
-  document.querySelectorAll('.al-svg').forEach(svg => {
-    const rate     = parseFloat(svg.dataset.rate);
-    const iconSize = factor * m * Math.log(1 + 10 * Math.min(rate, 12));
-    const h = Math.max(iconSize * CANVAS_H, 1);
-    const w = Math.max(iconSize * CANVAS_W, 0.5);
-    svg.setAttribute('width',  w.toFixed(2));
-    svg.setAttribute('height', h.toFixed(2));
+  const zoom = map ? Math.max(5, Math.min(11, map.getZoom())) : 7;
+  const t    = (zoom - 5) / 6;
+  const factor = 0.8 + t * (2.2 - 0.8);
+  document.querySelectorAll('.arc-swatch').forEach(el => {
+    const rate = parseFloat(el.dataset.rate);
+    const logRate = 0.5 + Math.max(0, Math.log(Math.max(rate, 0.01) / 0.1));
+    el.style.height = `${Math.max(factor * m * logRate, 1).toFixed(1)}px`;
   });
 }
 
-function addArrowLayer() {
-  const toArrow = (f) => f.properties.arrow_lng != null && f.properties.arrow_bearing != null
-    ? {
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [f.properties.arrow_lng, f.properties.arrow_lat] },
-        properties: {
-          bearing: f.properties.arrow_bearing,
-          rate: f.properties.erosion_rate ?? 1,
-        },
-      }
-    : null;
+function addCoastalArcLayer() {
+  if (!coastalArcsGeojson) return;
 
-  const arrowFeatures = [
-    ...geojson.features,
-    ...(nodecretGeojson?.features ?? []),
-  ].map(toArrow).filter(Boolean);
-
-  if (!arrowFeatures.length) return;
-
-  // Canvas arrow (évite les problèmes de chargement SVG data URL)
-  const W = 20, H = 40;
-  const canvas = document.createElement('canvas');
-  canvas.width = W; canvas.height = H;
-  const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#0f172a';
-  // Tête de flèche (triangle pointant vers le haut)
-  ctx.beginPath();
-  ctx.moveTo(W / 2, 1);
-  ctx.lineTo(W, 17);
-  ctx.lineTo(0, 17);
-  ctx.closePath();
-  ctx.fill();
-  // Fût
-  ctx.fillRect(W / 2 - 3, 15, 6, 24);
-
-  const imageData = ctx.getImageData(0, 0, W, H);
-  map.addImage('arrow-up', { width: W, height: H, data: imageData.data });
-
-  map.addSource('erosion-arrows', {
+  map.addSource('coastal-arcs', {
     type: 'geojson',
-    data: { type: 'FeatureCollection', features: arrowFeatures },
+    data: coastalArcsGeojson,
   });
 
   map.addLayer({
-    id: 'erosion-arrows',
-    type: 'symbol',
-    source: 'erosion-arrows',
+    id: 'coastal-arcs-line',
+    type: 'line',
+    source: 'coastal-arcs',
     layout: {
-      'icon-image': 'arrow-up',
-      'icon-anchor': 'bottom',
-      'icon-rotation-alignment': 'map',
-      'icon-rotate': ['get', 'bearing'],
-      'icon-size': arrowSizeExpr(1),
-      'icon-allow-overlap': true,
+      'line-join': 'round',
+      'line-cap':  'round',
       'visibility': 'visible',
     },
-    paint: { 'icon-opacity': 0.8 },
+    paint: {
+      'line-color':   ARC_COLOR_EXPR,
+      'line-width':   arcWidthExpr(2),
+      'line-opacity': 0.9,
+    },
   });
 
-  map.on('zoom', updateArrowLegend);
+  map.on('zoom', updateArcLegend);
 }
 
 function recomputePrice(features, sems) {
@@ -485,6 +500,8 @@ function updateMapPrice(fromYear, toYear) {
 function buildLegend() { buildLegendPrice(); }
 
 function buildLegendPrice() {
+  const explain = document.getElementById('legend-delta-explain');
+  if (explain) explain.classList.add('hidden');
   document.getElementById('legend-gradient').style.background =
     `linear-gradient(to right, ${COLORS.quintiles.join(', ')})`;
   document.getElementById('legend-price-title').innerHTML =
@@ -506,12 +523,21 @@ function buildLegendDelta(mode) {
   document.getElementById('legend-gradient').style.background =
     `linear-gradient(to right, ${DELTA_COLORS.join(', ')})`;
   document.getElementById('legend-price-title').innerHTML = mode === 'delta1y'
-    ? `Variation de prix <span class="legend-unit">1 an avant·après le décret</span>`
-    : `Variation de prix <span class="legend-unit">2 ans avant·après le décret</span>`;
+    ? `Variation des prix <span class="legend-unit">1 an avant·après le décret</span>`
+    : `Variation des prix <span class="legend-unit">2 ans avant·après le décret</span>`;
   document.getElementById('legend-ticks').innerHTML =
-    [25,50,75].map(p => `<span class="legend-tick" style="left:${p}%"></span>`).join('');
+    [25, 50, 75].map(p =>
+      `<span class="legend-tick${p === 50 ? ' legend-tick-zero' : ''}" style="left:${p}%"></span>`
+    ).join('');
   document.getElementById('legend-labels').innerHTML =
-    DELTA_STOPS.map(v => `<span>${v>0?'+':''}${v}%</span>`).join('');
+    DELTA_STOPS.map(v => {
+      if (v === -15) return `<span>−15%<span class="legend-label-ext">ou moins</span></span>`;
+      if (v ===  15) return `<span>+15%<span class="legend-label-ext">ou plus</span></span>`;
+      if (v ===   0) return `<span class="legend-label-zero">0%</span>`;
+      return `<span>${v > 0 ? '+' : ''}${v}%</span>`;
+    }).join('');
+  const explain = document.getElementById('legend-delta-explain');
+  if (explain) explain.classList.remove('hidden');
 }
 
 function updateMapMode(mode) {
@@ -521,12 +547,14 @@ function updateMapMode(mode) {
 
   const yearRange = document.getElementById('legend-year-range');
 
+  const choroplethOpacity = showChoropleth ? 0.72 : 0;
+
   if (mode === 'price') {
     yearRange.classList.remove('hidden');
     updateMapPrice(priceYearFrom, priceYearTo);
-    // Communes sans décret : opacité normale
+    map.setPaintProperty('communes-fill', 'fill-opacity', choroplethOpacity);
     if (map.getLayer('communes-nc-fill'))
-      map.setPaintProperty('communes-nc-fill', 'fill-opacity', 0.72);
+      map.setPaintProperty('communes-nc-fill', 'fill-opacity', choroplethOpacity);
   } else {
     yearRange.classList.add('hidden');
     const prop = mode === 'delta1y' ? 'delta_1y' : 'delta_2y';
@@ -537,7 +565,8 @@ function updateMapMode(mode) {
         ...DELTA_STOPS.flatMap((v,i) => [v, DELTA_COLORS[i]]),
       ],
     ]);
-    // Communes sans décret : transparentes (pas de décret de référence)
+    map.setPaintProperty('communes-fill', 'fill-opacity', choroplethOpacity);
+    // Communes sans décret : transparentes en mode delta (pas de décret de référence)
     if (map.getLayer('communes-nc-fill'))
       map.setPaintProperty('communes-nc-fill', 'fill-opacity', 0);
     buildLegendDelta(mode);
@@ -579,7 +608,7 @@ function openSidebar(props) {
 
   const delta = props.price_delta_pct;
   const deltaEl = document.getElementById('sb-delta');
-  if (delta !== null && delta !== 0) {
+  if (delta != null && delta !== 0) {
     deltaEl.textContent = `${delta > 0 ? '+' : ''}${delta.toFixed(1)} %`;
     deltaEl.className = 'kpi-value ' + (delta >= 0 ? 'pos' : 'neg');
   } else {
@@ -946,41 +975,101 @@ function initScatter() {
 
 // ── Comparison ────────────────────────────────────────────────
 function addToCompare(props) {
-  if (!compareSelA) {
-    compareSelA = props;
-    renderComparePanel('a', props);
-  } else if (!compareSelB) {
-    compareSelB = props;
-    renderComparePanel('b', props);
-  } else {
-    compareSelA = props;
-    compareSelB = null;
-    renderComparePanel('a', props);
-    clearComparePanel('b');
-  }
-  // Switch to compare view
   setView('compare');
+  addToCompareSelection(props);
 }
 
-function renderComparePanel(side, props) {
-  const panel = document.getElementById(`compare-panel-${side}`);
-  panel.classList.remove('empty');
+function addToCompareSelection(props) {
+  const code = props.code_insee;
+  if (compareSelections.some(p => p.code_insee === code)) return;
+  if (compareSelections.length >= COMPARE_MAX) return;
+  compareSelections.push(props);
+  renderCompareChips();
+  renderComparePanels();
+  renderOverlayChart();
+}
 
-  const byS   = props.price_by_semester ?? {};
+function removeFromCompare(code) {
+  compareSelections = compareSelections.filter(p => p.code_insee !== code);
+  const ch = compareCharts.get(code);
+  if (ch) { ch.destroy(); compareCharts.delete(code); }
+  renderCompareChips();
+  renderComparePanels();
+  renderOverlayChart();
+}
+
+function renderCompareChips() {
+  const container = document.getElementById('compare-chips');
+  if (!container) return;
+  container.innerHTML = compareSelections.map((p, i) => {
+    const color = COMPARE_COLORS[i % COMPARE_COLORS.length];
+    return `<span class="compare-chip" style="--chip-color:${color}" data-code="${p.code_insee}">
+      <span class="chip-dot" style="background:${color}"></span>
+      ${p.nom}
+      <button class="chip-remove" aria-label="Retirer">×</button>
+    </span>`;
+  }).join('');
+  container.querySelectorAll('.chip-remove').forEach(btn => {
+    btn.addEventListener('click', () => removeFromCompare(btn.closest('.compare-chip').dataset.code));
+  });
+  const box = document.getElementById('compare-search-box');
+  if (box) box.style.display = compareSelections.length >= COMPARE_MAX ? 'none' : '';
+}
+
+function renderComparePanels() {
+  // Destroy charts for communes no longer selected
+  for (const [code, ch] of compareCharts) {
+    if (!compareSelections.some(p => p.code_insee === code)) {
+      ch.destroy(); compareCharts.delete(code);
+    }
+  }
+
+  const container = document.getElementById('compare-panels');
+  if (!container) return;
+
+  if (!compareSelections.length) {
+    container.innerHTML = '<p class="compare-empty-hint">Ajoutez des communes via la recherche ou en cliquant sur la carte.</p>';
+    return;
+  }
+
+  // Remove panels for deselected communes
+  container.querySelectorAll('.compare-panel[data-code]').forEach(panel => {
+    if (!compareSelections.some(p => p.code_insee === panel.dataset.code)) panel.remove();
+  });
+
+  // Add/refresh panels in selection order
+  const existing = [...container.querySelectorAll('.compare-panel[data-code]')];
+  compareSelections.forEach((props, i) => {
+    const color = COMPARE_COLORS[i % COMPARE_COLORS.length];
+    let panel = container.querySelector(`.compare-panel[data-code="${props.code_insee}"]`);
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.className = 'compare-panel';
+      panel.dataset.code = props.code_insee;
+      container.appendChild(panel);
+    }
+    renderSingleComparePanel(panel, props, color);
+  });
+}
+
+function renderSingleComparePanel(panel, props, color) {
+  const code = props.code_insee;
+  const byS  = typeof props.price_by_semester === 'string'
+    ? JSON.parse(props.price_by_semester)
+    : (props.price_by_semester ?? {});
   const labels = SEMESTERS.map(s => s.replace('-', ' '));
   const data   = SEMESTERS.map(s => byS[s] ?? null);
 
   const badgeHtml = props.erosion_class
     ? `<span class="badge badge-${props.erosion_class}">${props.erosion_class === 'fort' ? 'Exposition forte' : 'Exposition moyenne'}</span>`
     : '<span class="badge badge-neutral">Non classée</span>';
-
   const delta = props.price_delta_pct;
   const deltaStr = (delta != null && delta !== 0)
     ? `<span style="color:${delta >= 0 ? '#dc2626' : '#16a34a'}">${delta > 0 ? '+' : ''}${delta.toFixed(1)}%</span>`
     : '—';
 
   panel.innerHTML = `
-    <div>
+    <div class="compare-panel-header" style="border-left:3px solid ${color};padding-left:10px">
       <p class="compare-commune-name">${props.nom ?? '—'}</p>
       <div class="badges" style="margin-top:6px">${badgeHtml}</div>
     </div>
@@ -989,55 +1078,189 @@ function renderComparePanel(side, props) {
       <div class="kpi"><span class="kpi-label">Prix médian</span><span class="kpi-value">${props.price_median_m2 > 0 ? fmt(props.price_median_m2) + ' €/m²' : '—'}</span></div>
       <div class="kpi"><span class="kpi-label">Post-2023</span><span class="kpi-value">${deltaStr}</span></div>
     </div>
-    <div class="compare-canvas-wrap"><canvas id="compare-chart-${side}" height="180"></canvas></div>
+    <div class="compare-canvas-wrap"><canvas id="compare-chart-${code}"></canvas></div>
   `;
 
-  // Destroy old chart
-  const oldChart = side === 'a' ? compareChartA : compareChartB;
-  if (oldChart) oldChart.destroy();
+  const old = compareCharts.get(code);
+  if (old) { old.destroy(); compareCharts.delete(code); }
 
-  const chart = new Chart(document.getElementById(`compare-chart-${side}`).getContext('2d'), {
+  if (compareViewMode === 'side') {
+    const canvas = document.getElementById(`compare-chart-${code}`);
+    if (!canvas) return;
+    const ch = new Chart(canvas.getContext('2d'), {
+      type: 'line',
+      data: { labels, datasets: [{ data, borderColor: color, backgroundColor: color + '18',
+        borderWidth: 2, fill: true, tension: 0.3, pointRadius: 4, spanGaps: true }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: false },
+          tooltip: { callbacks: { label: (c) => c.raw != null ? `${fmt(c.raw)} €/m²` : 'N/D' } } },
+        scales: {
+          x: { ticks: { font: { size: 9 } }, grid: { display: false } },
+          y: { ticks: { font: { size: 9 }, callback: (v) => v >= 1000 ? `${(v/1000).toFixed(1).replace(/\.0$/,'')}k€` : `${v}€` } },
+        },
+      },
+    });
+    compareCharts.set(code, ch);
+  }
+}
+
+function setCompareViewMode(mode) {
+  compareViewMode = mode;
+  document.getElementById('btn-compare-side').classList.toggle('active', mode === 'side');
+  document.getElementById('btn-compare-overlay').classList.toggle('active', mode === 'overlay');
+  const panels  = document.getElementById('compare-panels');
+  const overlay = document.getElementById('compare-overlay');
+  if (mode === 'overlay') {
+    panels.classList.add('overlay-mode');
+    overlay.classList.remove('hidden');
+    renderOverlayChart();
+  } else {
+    panels.classList.remove('overlay-mode');
+    overlay.classList.add('hidden');
+    if (compareOverlayChart) { compareOverlayChart.destroy(); compareOverlayChart = null; }
+    renderComparePanels(); // recreate individual charts now that canvases are visible
+  }
+}
+
+function renderOverlayChart() {
+  if (compareViewMode !== 'overlay') return;
+
+  const labels   = SEMESTERS.map(s => s.replace('-', ' '));
+  const datasets = compareSelections.map((props, i) => {
+    const color = COMPARE_COLORS[i % COMPARE_COLORS.length];
+    const byS   = typeof props.price_by_semester === 'string'
+      ? JSON.parse(props.price_by_semester)
+      : (props.price_by_semester ?? {});
+    return {
+      label: props.nom,
+      data:  SEMESTERS.map(s => byS[s] ?? null),
+      borderColor: color, backgroundColor: 'transparent',
+      borderWidth: 2.5, fill: false, tension: 0.3, pointRadius: 3, spanGaps: true,
+    };
+  });
+
+  const legendEl = document.getElementById('compare-overlay-legend');
+  if (legendEl) {
+    legendEl.innerHTML = compareSelections.map((p, i) => {
+      const color = COMPARE_COLORS[i % COMPARE_COLORS.length];
+      return `<span class="overlay-legend-item" style="--legend-color:${color}">${p.nom}</span>`;
+    }).join('');
+  }
+
+  const canvas = document.getElementById('compare-overlay-chart');
+  if (!canvas) return;
+  if (compareOverlayChart) { compareOverlayChart.destroy(); compareOverlayChart = null; }
+  if (!datasets.length) return;
+
+  compareOverlayChart = new Chart(canvas.getContext('2d'), {
     type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        data,
-        borderColor: side === 'a' ? '#0ea5e9' : '#a855f7',
-        backgroundColor: side === 'a' ? 'rgba(14,165,233,.1)' : 'rgba(168,85,247,.1)',
-        borderWidth: 2, fill: true, tension: 0.3, pointRadius: 4, spanGaps: true,
-      }],
-    },
+    data: { labels, datasets },
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => c.raw != null ? `${fmt(c.raw)} €/m²` : 'N/D' } } },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (c) => c.raw != null
+          ? `${c.dataset.label} : ${fmt(c.raw)} €/m²`
+          : `${c.dataset.label} : N/D` } },
+      },
       scales: {
         x: { ticks: { font: { size: 9 } }, grid: { display: false } },
-        y: { ticks: { font: { size: 9 }, callback: (v) => `${Math.round(v/1000)}k` } },
+        y: { ticks: { font: { size: 10 }, callback: (v) => v >= 1000
+          ? `${(v/1000).toFixed(1).replace(/\.0$/,'')}k€` : `${v}€` } },
       },
     },
   });
-
-  if (side === 'a') compareChartA = chart; else compareChartB = chart;
 }
 
-function clearComparePanel(side) {
-  const panel = document.getElementById(`compare-panel-${side}`);
-  panel.classList.add('empty');
-  panel.innerHTML = `<p class="compare-placeholder">Sélectionnez une commune ${side.toUpperCase()}</p>`;
-  if (side === 'a' && compareChartA) { compareChartA.destroy(); compareChartA = null; }
-  if (side === 'b' && compareChartB) { compareChartB.destroy(); compareChartB = null; }
+function exportCompareCSV() {
+  if (!compareSelections.length) return;
+  const cols = ['Commune','Département','Classe érosion','Recul (m/an)','Prix médian (€/m²)','Variation post-décret (%)'];
+  SEMESTERS.forEach(s => cols.push(s));
+
+  const rows = compareSelections.map(p => {
+    const byS = typeof p.price_by_semester === 'string'
+      ? JSON.parse(p.price_by_semester) : (p.price_by_semester ?? {});
+    const row = [
+      p.nom ?? '',
+      p.departement ?? '',
+      p.erosion_class ?? '',
+      p.erosion_rate > 0 ? p.erosion_rate : '',
+      p.price_median_m2 > 0 ? p.price_median_m2 : '',
+      p.price_delta_pct != null ? p.price_delta_pct.toFixed(1) : '',
+    ];
+    SEMESTERS.forEach(s => row.push(byS[s] ?? ''));
+    return row;
+  });
+
+  const esc = v => `"${String(v).replace(/"/g, '""')}"`;
+  const csv = [cols, ...rows].map(r => r.map(esc).join(',')).join('\r\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'comparaison_communes.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function exportComparePDF() {
+  window.print();
 }
 
 function bindCompare() {
-  bindSearch('#compare-search-a', '#compare-results-a', (props) => {
-    compareSelA = props;
-    renderComparePanel('a', props);
-    document.getElementById('compare-search-a').value = props.nom;
+  document.getElementById('btn-compare-side').addEventListener('click',    () => setCompareViewMode('side'));
+  document.getElementById('btn-compare-overlay').addEventListener('click', () => setCompareViewMode('overlay'));
+  document.getElementById('btn-export-csv').addEventListener('click', exportCompareCSV);
+  document.getElementById('btn-export-pdf').addEventListener('click', exportComparePDF);
+
+  // Search across decree + nc communes
+  const input    = document.getElementById('compare-search-input');
+  const dropdown = document.getElementById('compare-search-results');
+  if (!input || !dropdown) return;
+
+  input.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    if (q.length < 2) { dropdown.classList.add('hidden'); return; }
+
+    const allFeats = [
+      ...(geojson?.features ?? []),
+      ...(nodecretGeojson?.features ?? []),
+    ];
+    const matches = allFeats
+      .filter(f => f.properties.nom?.toLowerCase().includes(q))
+      .filter(f => !compareSelections.some(s => s.code_insee === f.properties.code_insee))
+      .slice(0, 8);
+
+    if (!matches.length) { dropdown.classList.add('hidden'); return; }
+
+    dropdown.innerHTML = matches.map(f => {
+      const p = f.properties;
+      const cls = p.erosion_class;
+      const badgeTxt = cls === 'fort' ? 'Fort' : cls === 'moyen' ? 'Moyen' : '';
+      const badgeCls = cls ? `item-badge badge-${cls}` : '';
+      return `<li data-code="${p.code_insee}">
+        <span>${p.nom}</span>
+        <span class="item-sub">${p.departement ?? ''} ${badgeTxt ? `<span class="${badgeCls}">${badgeTxt}</span>` : ''}</span>
+      </li>`;
+    }).join('');
+    dropdown.classList.remove('hidden');
+
+    dropdown.querySelectorAll('li').forEach(li => {
+      li.addEventListener('click', () => {
+        const code = li.dataset.code;
+        const feat = [...(geojson?.features ?? []), ...(nodecretGeojson?.features ?? [])]
+          .find(f => f.properties.code_insee === code);
+        if (!feat) return;
+        dropdown.classList.add('hidden');
+        input.value = '';
+        addToCompareSelection(feat.properties);
+      });
+    });
   });
-  bindSearch('#compare-search-b', '#compare-results-b', (props) => {
-    compareSelB = props;
-    renderComparePanel('b', props);
-    document.getElementById('compare-search-b').value = props.nom;
+
+  document.addEventListener('click', (e) => {
+    if (!input.contains(e.target) && !dropdown.contains(e.target))
+      dropdown.classList.add('hidden');
   });
 }
 
@@ -1126,32 +1349,6 @@ function bindNav() {
   document.getElementById('btn-about')  .addEventListener('click', () => setView('about'));
 }
 
-function animateScatter() {
-  if (!scatterChart || !_scatterGroups || !_buildDataset) return;
-  const isLogX = document.getElementById('toggle-log-x')?.checked ?? false;
-
-  const realData = _scatterGroups.map(g => _buildDataset(g, isLogX, scatterLogY, false).data);
-  const duration = 700;
-  let   start    = null;
-
-  function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
-
-  function tick(now) {
-    if (!start) start = now;          // initialise sur le 1er frame réel, pas avant rAF
-    const t    = Math.min((now - start) / duration, 1);
-    const ease = easeOutCubic(t);
-    _scatterGroups.forEach((g, gi) => {
-      scatterChart.data.datasets[gi].data = realData[gi].map(pt => ({
-        ...pt, y: pt.y * ease,
-      }));
-    });
-    scatterChart.update('none');
-    if (t < 1) requestAnimationFrame(tick);
-  }
-
-  requestAnimationFrame(tick);
-}
-
 function setView(name) {
   ['map','scatter','compare','about'].forEach(v => {
     document.getElementById(`view-${v}`).classList.toggle('active',  v === name);
@@ -1159,10 +1356,7 @@ function setView(name) {
     document.getElementById(`btn-${v}`).classList.toggle('active', v === name);
     document.getElementById(`btn-${v}`).setAttribute('aria-selected', v === name);
   });
-  if (name === 'scatter') {
-    scatterChart?.resize();
-    animateScatter();
-  }
+  if (name === 'scatter') scatterChart?.resize();
 }
 
 // ── Helpers ───────────────────────────────────────────────────
